@@ -1,0 +1,6 @@
+flask
+flask-cors
+osmnx
+networkx
+requests
+gunicorn

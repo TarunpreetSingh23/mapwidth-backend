@@ -20,7 +20,6 @@ G_CACHED = None
 CACHED_BBOX = None
 
 # --- Estimated Speeds (km/h) based on highway type for time calculation ---
-# Used for average travel time estimation.
 AVG_SPEEDS_KMH = {
     'motorway': 90,
     'trunk': 80,
@@ -42,10 +41,8 @@ def load_default_graph():
         return
 
     try:
-        # NOTE: Using 'all' for network_type initially to get all edges, then filter by drive later if needed
-        # We'll stick to 'drive' as in the original code.
         G_CACHED = ox.graph_from_point(
-            (DEFAULT_CENTER_LAT, DEFAULT_CENTER_LON),
+            point=(DEFAULT_CENTER_LAT, DEFAULT_CENTER_LON), # Use keyword argument for 'point'
             dist=DEFAULT_DIST,
             network_type='drive'
         )
@@ -65,18 +62,15 @@ def load_default_graph():
 # --- Estimate edge width (Unchanged) ---
 def estimate_edge_width(data):
     width = None
-    # Width tag
     if 'width' in data:
         try:
             width = float(data['width'][0] if isinstance(data['width'], list) else data['width'])
         except: pass
-    # Lanes
     if width is None and 'lanes' in data:
         try:
             lanes = int(data['lanes'][0] if isinstance(data['lanes'], list) else data['lanes'])
             width = lanes * DEFAULT_LANE_WIDTH
         except: pass
-    # Fallback by highway type
     if width is None:
         hw = data.get('highway', 'residential')
         if isinstance(hw, list):
@@ -116,7 +110,8 @@ if OSMNX_AVAILABLE:
 
         if G_base is None:
             try:
-                G_base = ox.graph_from_bbox(north, south, east, west, network_type='drive')
+                # FIX 1: Use keyword arguments for graph_from_bbox
+                G_base = ox.graph_from_bbox(north=north, south=south, east=east, west=west, network_type='drive')
             except Exception as e:
                 return jsonify({"error": f"Could not build road network: {e}"}), 500
 
@@ -146,10 +141,10 @@ if OSMNX_AVAILABLE:
             G_request.remove_edge(*edge)
 
         # --- Compute route ---
-        orig = ox.distance.nearest_nodes(G_request, s_lon, s_lat)
-        dest = ox.distance.nearest_nodes(G_request, e_lon, e_lat)
+        # FIX 2: Use keyword arguments for nearest_nodes
+        orig = ox.distance.nearest_nodes(G_request, X=s_lon, Y=s_lat)
+        dest = ox.distance.nearest_nodes(G_request, X=e_lon, Y=e_lat)
         
-        # The graph used for routing, starts with the width-restricted one
         G_route = G_request
         is_fallback = False
 
@@ -160,17 +155,14 @@ if OSMNX_AVAILABLE:
         except nx.NetworkXNoPath:
             # 2. FALLBACK: Route failed. Try on the original, unrestricted graph (G_base).
             
-            # Re-find nearest nodes on the original graph G_base
-            orig_fallback = ox.distance.nearest_nodes(G_base, s_lon, s_lat)
-            dest_fallback = ox.distance.nearest_nodes(G_base, e_lon, e_lat)
+            # FIX 3: Use keyword arguments for nearest_nodes on fallback
+            orig_fallback = ox.distance.nearest_nodes(G_base, X=s_lon, Y=s_lat)
+            dest_fallback = ox.distance.nearest_nodes(G_base, X=e_lon, Y=e_lat)
             
-            G_route = G_base # Switch to the unrestricted graph
+            G_route = G_base
             is_fallback = True
 
             try:
-                # Need to ensure 'weight' (length) exists on G_base if it wasn't processed above.
-                # Since G_request was a deepcopy of G_base, we assume G_base has 'length'/'weight'.
-                # But to be safe, we assign the weight attribute if it's missing.
                 for _, _, data in G_route.edges(data=True):
                     if 'weight' not in data:
                         data['weight'] = data.get('length', 1)
@@ -197,7 +189,6 @@ if OSMNX_AVAILABLE:
             if not data:
                 continue
             
-            # --- Ensure metrics exist for the final graph (important for fallback) ---
             if 'travel_time_min' not in data:
                 hw = data.get('highway')
                 if isinstance(hw, list):
@@ -206,11 +197,9 @@ if OSMNX_AVAILABLE:
                 data['travel_time_min'] = (data.get('length', 1) / (speed_kmh * 1000 / 60))
 
 
-            # Sum distance (in meters) and time (in minutes)
             total_distance_m += data.get('length', 0)
             total_duration_min += data.get('travel_time_min', 0)
 
-            # Collect route names
             name = data.get('name') or data.get('ref') or data.get('highway')
             if isinstance(name, list):
                 name = name[0]

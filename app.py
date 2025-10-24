@@ -1,12 +1,12 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+import networkx as nx
+
 try:
     import osmnx as ox
-    import networkx as nx
     OSMNX_AVAILABLE = True
 except Exception:
     OSMNX_AVAILABLE = False
-import copy
 
 app = Flask(__name__)
 CORS(app)
@@ -18,8 +18,9 @@ DEFAULT_CENTER_LON = 74.8770
 DEFAULT_DIST = 5000
 G_CACHED = None
 CACHED_BBOX = None
+PENALTY_WEIGHT = 1e6  # very high travel time for narrow roads
 
-# --- Estimated Speeds (km/h) based on highway type for time calculation ---
+# --- Average Speeds (km/h) ---
 AVG_SPEEDS_KMH = {
     'motorway': 90,
     'trunk': 80,
@@ -29,20 +30,18 @@ AVG_SPEEDS_KMH = {
     'residential': 25,
     'service': 15,
     'unclassified': 20,
-    'default': 30  # Fallback speed
+    'default': 30
 }
 
 
-# --- Load default graph ---
 def load_default_graph():
     global G_CACHED, CACHED_BBOX
     if not OSMNX_AVAILABLE:
-        print("OSMNX not available, caching skipped.")
+        print("OSMNX not available, skipping cache.")
         return
-
     try:
         G_CACHED = ox.graph_from_point(
-            point=(DEFAULT_CENTER_LAT, DEFAULT_CENTER_LON), # Use keyword argument for 'point'
+            (DEFAULT_CENTER_LAT, DEFAULT_CENTER_LON),
             dist=DEFAULT_DIST,
             network_type='drive'
         )
@@ -53,180 +52,125 @@ def load_default_graph():
             max(nodes[n]['y'] for n in nodes),
             max(nodes[n]['x'] for n in nodes)
         )
-        print("Default graph loaded successfully.")
+        print("✅ Default graph loaded successfully.")
     except Exception as e:
-        print(f"Failed to load default graph: {e}. Routing will use on-the-fly calls.")
+        print(f"⚠️ Failed to load default graph: {e}")
         G_CACHED = None
 
 
-# --- Estimate edge width (Unchanged) ---
 def estimate_edge_width(data):
     width = None
     if 'width' in data:
         try:
             width = float(data['width'][0] if isinstance(data['width'], list) else data['width'])
-        except: pass
+        except:
+            pass
     if width is None and 'lanes' in data:
         try:
             lanes = int(data['lanes'][0] if isinstance(data['lanes'], list) else data['lanes'])
             width = lanes * DEFAULT_LANE_WIDTH
-        except: pass
+        except:
+            pass
     if width is None:
         hw = data.get('highway', 'residential')
         if isinstance(hw, list):
             hw = hw[0]
-        heur = {'motorway':11,'trunk':10,'primary':9,'secondary':8,'tertiary':7,'residential':6,'service':4}
+        heur = {'motorway': 11, 'trunk': 10, 'primary': 9, 'secondary': 8,
+                'tertiary': 7, 'residential': 6, 'service': 4}
         width = heur.get(hw, 5.5)
     return width
 
-# --- Route endpoint ---
-if OSMNX_AVAILABLE:
-    @app.route("/route")
-    def get_route():
+
+@app.route("/route")
+def get_route():
+    if not OSMNX_AVAILABLE:
+        return jsonify({"error": "OSMnx not installed"}), 501
+
+    try:
+        s_lat = float(request.args.get('start_lat'))
+        s_lon = float(request.args.get('start_lon'))
+        e_lat = float(request.args.get('end_lat'))
+        e_lon = float(request.args.get('end_lon'))
+        vehicle_width = float(request.args.get('vehicle_width', 3.0))
+    except:
+        return jsonify({"error": "Missing or invalid coordinates"}), 400
+
+    north = max(s_lat, e_lat) + 0.005
+    south = min(s_lat, e_lat) - 0.005
+    east = max(s_lon, e_lon) + 0.005
+    west = min(s_lon, e_lon) - 0.005
+
+    G_base = None
+    if G_CACHED and CACHED_BBOX:
+        min_lat, min_lon, max_lat, max_lon = CACHED_BBOX
+        if south >= min_lat and north <= max_lat and west >= min_lon and east <= max_lon:
+            G_base = G_CACHED
+
+    if G_base is None:
         try:
-            s_lat = float(request.args.get('start_lat'))
-            s_lon = float(request.args.get('start_lon'))
-            e_lat = float(request.args.get('end_lat'))
-            e_lon = float(request.args.get('end_lon'))
-        except:
-            return jsonify({"error": "Missing or invalid coordinates"}), 400
+            G_base = ox.graph_from_bbox(north, south, east, west, network_type='drive')
+        except Exception as e:
+            return jsonify({"error": f"Could not build road network: {e}"}), 500
 
-        try:
-            vehicle_width = float(request.args.get('vehicle_width', 3.0))
-        except:
-            return jsonify({"error": "Invalid vehicle_width value"}), 400
+    G_processed = G_base.copy()
 
-        north = max(s_lat, e_lat) + 0.005
-        south = min(s_lat, e_lat) - 0.005
-        east = max(s_lon, e_lon) + 0.005
-        west = min(s_lon, e_lon) - 0.005
+    # --- Add edge speeds safely ---
+    for u, v, k, data in G_processed.edges(keys=True, data=True):
+        hw = data.get('highway', 'default')
+        if isinstance(hw, list):
+            hw = hw[0]
+        data['speed_kph'] = AVG_SPEEDS_KMH.get(hw, AVG_SPEEDS_KMH['default'])
 
-        # Determine which graph to use (cached or on-the-fly)
-        G_base = None
-        if G_CACHED and CACHED_BBOX:
-            min_lat, min_lon, max_lat, max_lon = CACHED_BBOX
-            if south >= min_lat and north <= max_lat and west >= min_lon and east <= max_lon:
-                G_base = G_CACHED
+    # --- Add travel times manually ---
+    for u, v, k, data in G_processed.edges(keys=True, data=True):
+        length_m = data.get('length', 1)
+        speed_mps = data['speed_kph'] * 1000 / 3600
+        data['travel_time'] = length_m / speed_mps  # seconds
 
-        if G_base is None:
-            try:
-                # FIX 1: Use keyword arguments for graph_from_bbox
-                G_base = ox.graph_from_bbox(north=north, south=south, east=east, west=west, network_type='drive')
-            except Exception as e:
-                return jsonify({"error": f"Could not build road network: {e}"}), 500
+    # --- Apply width penalties ---
+    for u, v, k, data in G_processed.edges(keys=True, data=True):
+        width = estimate_edge_width(data)
+        if width < vehicle_width:
+            data['travel_time'] += PENALTY_WEIGHT
 
-        # --- Prepare G_request (Width-Restricted Graph) ---
-        G_request = copy.deepcopy(G_base)
-        edges_to_remove = []
+    try:
+        orig_node = ox.distance.nearest_nodes(G_processed, s_lon, s_lat)
+        dest_node = ox.distance.nearest_nodes(G_processed, e_lon, e_lat)
+        route = nx.shortest_path(G_processed, orig_node, dest_node, weight='travel_time')
+    except nx.NetworkXNoPath:
+        return jsonify({"error": "No route found"}), 404
+    except Exception as e:
+        return jsonify({"error": f"Routing error: {e}"}), 500
 
-        # Add necessary metrics (width_est, speed, time) and identify edges to remove
-        for u, v, k, data in G_request.edges(keys=True, data=True):
-            width = estimate_edge_width(data)
-            data['width_est'] = width
-            data['weight'] = data.get('length', 1) 
+    coords = [(G_processed.nodes[n]['y'], G_processed.nodes[n]['x']) for n in route]
 
-            # Estimate speed for time calculation
-            hw = data.get('highway')
-            if isinstance(hw, list):
-                hw = hw[0]
-            speed_kmh = AVG_SPEEDS_KMH.get(hw, AVG_SPEEDS_KMH['default'])
-            data['speed_kmh'] = speed_kmh
-            data['travel_time_min'] = (data.get('length', 1) / (speed_kmh * 1000 / 60))
+    total_distance = 0
+    total_time_s = 0
+    route_names = []
 
-            if width < vehicle_width:
-                edges_to_remove.append((u, v, k))
-        
-        # Remove width-restricted edges
-        for edge in edges_to_remove:
-            G_request.remove_edge(*edge)
+    for i in range(len(route) - 1):
+        u, v = route[i], route[i + 1]
+        d = G_processed.get_edge_data(u, v, 0)
+        total_distance += d.get('length', 0)
+        total_time_s += d.get('travel_time', 0)
+        name = d.get('name') or d.get('ref') or d.get('highway')
+        if isinstance(name, list):
+            name = name[0]
+        if not name:
+            name = "Unnamed Road"
+        if name not in route_names:
+            route_names.append(name)
 
-        # --- Compute route ---
-        # FIX 2: Use keyword arguments for nearest_nodes
-        orig = ox.distance.nearest_nodes(G_request, X=s_lon, Y=s_lat)
-        dest = ox.distance.nearest_nodes(G_request, X=e_lon, Y=e_lat)
-        
-        G_route = G_request
-        is_fallback = False
+    response = {
+        "route": coords,
+        "route_names": route_names,
+        "distance_km": round(total_distance / 1000, 2),
+        "duration_min": round(total_time_s / 60, 1),  # convert seconds → minutes
+        "vehicle_width": vehicle_width
+    }
 
-        try:
-            # 1. Attempt route calculation on the width-restricted graph (G_request)
-            route = nx.shortest_path(G_route, orig, dest, weight='weight')
+    return jsonify(response)
 
-        except nx.NetworkXNoPath:
-            # 2. FALLBACK: Route failed. Try on the original, unrestricted graph (G_base).
-            
-            # FIX 3: Use keyword arguments for nearest_nodes on fallback
-            orig_fallback = ox.distance.nearest_nodes(G_base, X=s_lon, Y=s_lat)
-            dest_fallback = ox.distance.nearest_nodes(G_base, X=e_lon, Y=e_lat)
-            
-            G_route = G_base
-            is_fallback = True
-
-            try:
-                for _, _, data in G_route.edges(data=True):
-                    if 'weight' not in data:
-                        data['weight'] = data.get('length', 1)
-
-                route = nx.shortest_path(G_route, orig_fallback, dest_fallback, weight='weight')
-                
-            except nx.NetworkXNoPath:
-                # 3. Final failure: No path even on the unrestricted graph.
-                return jsonify({"error": "No route available, even without width restrictions."}), 404
-            except Exception as e:
-                return jsonify({"error": f"Fallback routing error: {e}"}), 500
-        
-        # --- Process successful route ---
-        coords = [(G_route.nodes[n]['y'], G_route.nodes[n]['x']) for n in route]
-
-        total_distance_m = 0
-        total_duration_min = 0
-        route_names = []
-        
-        for i in range(len(route) - 1):
-            u, v = route[i], route[i + 1]
-            data = G_route.get_edge_data(u, v, 0) 
-            
-            if not data:
-                continue
-            
-            if 'travel_time_min' not in data:
-                hw = data.get('highway')
-                if isinstance(hw, list):
-                    hw = hw[0]
-                speed_kmh = AVG_SPEEDS_KMH.get(hw, AVG_SPEEDS_KMH['default'])
-                data['travel_time_min'] = (data.get('length', 1) / (speed_kmh * 1000 / 60))
-
-
-            total_distance_m += data.get('length', 0)
-            total_duration_min += data.get('travel_time_min', 0)
-
-            name = data.get('name') or data.get('ref') or data.get('highway')
-            if isinstance(name, list):
-                name = name[0]
-            if not name:
-                name = f"Unnamed Road ({round(data.get('length',0))} m)"
-            if name not in route_names:
-                route_names.append(name)
-        
-        total_distance_km = total_distance_m / 1000
-
-        response = {
-            "route": coords,
-            "route_names": route_names,
-            "num_nodes": len(coords),
-            "vehicle_width": vehicle_width,
-            "distance_km": round(total_distance_km, 2),
-            "duration_min": round(total_duration_min)
-        }
-        
-        if is_fallback:
-            response["error"] = "Warning: The width-restricted route failed. Displaying an alternate route (all roads included)."
-
-        return jsonify(response)
-
-    @app.route("/route")
-    def route_not_available():
-        return jsonify({"error": "osmnx or networkx not available"}), 501
 
 if __name__ == "__main__":
     load_default_graph()
